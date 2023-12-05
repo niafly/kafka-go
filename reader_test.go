@@ -1798,7 +1798,7 @@ func TestReaderReadCompactedMessage(t *testing.T) {
 
 	msgs := makeTestDuplicateSequence()
 
-	writeMessagesForCompactionCheck(t, topic, msgs)
+	writeMessagesForCompactionCheck(t, topic, msgs, 3)
 
 	expectedKeys := map[string]int{}
 	for _, msg := range msgs {
@@ -1835,7 +1835,10 @@ func TestReaderReadCompactedMessage(t *testing.T) {
 				}
 			}
 		}()
+
+		time.Sleep(time.Hour)
 		if success {
+			t.Fatal()
 			return
 		}
 		select {
@@ -1846,15 +1849,77 @@ func TestReaderReadCompactedMessage(t *testing.T) {
 	}
 }
 
+func TestReaderReadCompactedMessage2(t *testing.T) {
+	topic := makeTopic()
+	createTopicWithCompaction2(t, topic, 1)
+	defer deleteTopic(t, topic)
+
+	msgs := makeTestDuplicateSequenceOnly()
+
+	// use single batch size to append multiple single-message batches
+	writeMessagesForCompactionCheck(t, topic, msgs, 1)
+
+	expectedKeys := map[string]int{}
+	for _, msg := range msgs {
+		expectedKeys[string(msg.Key)] = 1
+	}
+
+	// kafka 2.0.1 is extra slow
+	ctx, cancel := context.WithTimeout(context.Background(), time.Hour*120)
+	defer cancel()
+	for {
+		success := func() bool {
+			time.Sleep(500 * time.Millisecond)
+			r := NewReader(ReaderConfig{
+				Brokers:  []string{"localhost:9092"},
+				Topic:    topic,
+				MinBytes: 320,
+				MaxBytes: 320,
+				// Speed up testing
+				// MaxWait: 100 * time.Millisecond,
+			})
+			defer r.Close()
+
+			keys := map[string]int{}
+			for {
+				m, err := r.FetchMessage(ctx)
+				if err != nil {
+					t.Logf("can't get message from compacted log: %v", err)
+					return false
+				}
+				keys[string(m.Key)]++
+
+				if len(keys) == countKeys(msgs) {
+					t.Logf("got keys: %+v", keys)
+					return reflect.DeepEqual(keys, expectedKeys)
+				}
+			}
+		}()
+
+		time.Sleep(10 * time.Minute)
+
+		if success {
+			return
+		}
+		t.Fatal()
+
+		select {
+		// case <-ctx.Done():
+		// 	t.Fatal(ctx.Err())
+		default:
+		}
+	}
+}
+
 // writeMessagesForCompactionCheck writes messages with specific writer configuration.
-func writeMessagesForCompactionCheck(t *testing.T, topic string, msgs []Message) {
+func writeMessagesForCompactionCheck(t *testing.T, topic string, msgs []Message, batchSize int) {
 	t.Helper()
 
 	wr := NewWriter(WriterConfig{
 		Brokers: []string{"localhost:9092"},
 		// Batch size must be large enough to have multiple compacted records
 		// for testing more edge cases.
-		BatchSize: 3,
+		BatchSize: batchSize,
 		Async:     false,
 		Topic:     topic,
 		Balancer:  &LeastBytes{},
@@ -1905,6 +1970,94 @@ func makeTestDuplicateSequence() []Message {
 	return msgs
 }
 
+// makeTestDuplicateSequence creates messages for compacted log testing
+//
+// All keys and values are 4 characters long to tightly control how many
+// messages are per log segment.
+func makeTestDuplicateSequenceOnly() []Message {
+	// bf := make([]byte, 50)
+	var msgs []Message
+
+	// "end markers" to force duplicate message outside of the last segment of
+	// the log so that they can all be compacted.
+	// metadata to be 22 bytes
+	// actual bytes as 76, 91, 106 ?
+	// init: 51?
+	// each messages as 15 bytes
+
+	// expected segment size = (50+4) * 3 = 162
+	// there are (200-162=38) rooms for 4 duplicate messages (8)
+
+	// `n` is an increasing counter so it is never compacted.
+	// `i` determines how many compacted records to create
+	// size = 22 + 8 = 30
+	for i := 0; i < 1; i++ {
+		msgs = append(msgs, Message{
+			Key:   []byte(fmt.Sprintf("e-%02d", i)),
+			Value: []byte(fmt.Sprintf("e-%02d", i)),
+		})
+	}
+
+	for i := 0; i < 2; i++ {
+		msgs = append(msgs, Message{
+			Key:   []byte("dup_"),
+			Value: []byte("dup_"),
+		})
+	}
+
+	msgs = append(msgs, Message{
+		Key:   []byte(fmt.Sprintf("e-%02d", 3)),
+		Value: []byte(fmt.Sprintf("e-%02d", 3)),
+	})
+
+	msgs = append(msgs, Message{
+		Key:   []byte(fmt.Sprintf("e-%02d", 4)),
+		Value: []byte(fmt.Sprintf("e-%02d", 4)),
+	})
+
+	/// done first segment
+
+	// fire a new segment to make sure compaction works
+	msgs = append(msgs, Message{
+		Key:   []byte("dup_"),
+		Value: []byte("dup_"),
+	})
+
+	msgs = append(msgs, Message{
+		Key:   []byte(fmt.Sprintf("e-%02d", 6)),
+		Value: []byte(fmt.Sprintf("e-%02d", 6)),
+	})
+
+	msgs = append(msgs, Message{
+		Key:   []byte(fmt.Sprintf("e-%02d", 7)),
+		Value: []byte(fmt.Sprintf("e-%02d", 7)),
+	})
+
+	msgs = append(msgs, Message{
+		Key:   []byte(fmt.Sprintf("e-%02d", 8)),
+		Value: []byte(fmt.Sprintf("e-%02d", 8)),
+	})
+	// done 2 segment
+
+	// third segment
+	msgs = append(msgs, Message{
+		Key:   []byte(fmt.Sprintf("e-%02d", 9)),
+		Value: []byte(fmt.Sprintf("e-%02d", 9)),
+	})
+
+	msgs = append(msgs, Message{
+		Key:   []byte(fmt.Sprintf("e-%02d", 10)),
+		Value: []byte(fmt.Sprintf("e-%02d", 10)),
+	})
+
+	msgs = append(msgs, Message{
+		Key:   []byte(fmt.Sprintf("e-%02d", 11)),
+		Value: []byte(fmt.Sprintf("e-%02d", 11)),
+	})
+
+	return msgs
+}
+
 // countKeys counts unique keys from given Message slice.
 func countKeys(msgs []Message) int {
 	m := make(map[string]struct{})
@@ -1943,6 +2096,66 @@ func createTopicWithCompaction(t *testing.T, topic string, partitions int) {
 			{
 				ConfigName:  "segment.bytes",
 				ConfigValue: "200",
+			},
+			{
+				ConfigName:  "min.cleanable.dirty.ratio",
+				ConfigValue: "0.95",
+			},
+			{
+				ConfigName:  "max.compaction.lag.ms",
+				ConfigValue: "50",
+			},
+		},
+	})
+	if err != nil {
+		if !errors.Is(err, TopicAlreadyExists) {
+			require.NoError(t, err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	waitForTopic(ctx, t, topic)
+}
+
+func createTopicWithCompaction2(t *testing.T, topic string, partitions int) {
+	t.Helper()
+
+	t.Logf("createTopic(%s, %d)", topic, partitions)
+
+	conn, err := Dial("tcp", "localhost:9092")
+	require.NoError(t, err)
+	defer conn.Close()
+
+	controller, err := conn.Controller()
+	require.NoError(t, err)
+
+	conn, err = Dial("tcp", net.JoinHostPort(controller.Host, strconv.Itoa(controller.Port)))
+	require.NoError(t, err)
+
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+	err = conn.CreateTopics(TopicConfig{
+		Topic:             topic,
+		NumPartitions:     partitions,
+		ReplicationFactor: 1,
+		ConfigEntries: []ConfigEntry{
+			{
+				ConfigName:  "cleanup.policy",
+				ConfigValue: "compact",
+			},
+			{
+				// Set as 250 for minimum segment size of 3 single-message batches
+				ConfigName:  "segment.bytes",
+				ConfigValue: "320",
+			},
+			{
+				ConfigName:  "min.cleanable.dirty.ratio",
+				ConfigValue: "0.95",
+			},
+			{
+				ConfigName:  "max.compaction.lag.ms",
+				ConfigValue: "50",
 			},
 		},
 	})
